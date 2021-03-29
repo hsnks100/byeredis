@@ -16,7 +16,8 @@
 class ByeRedis {
 
     public:
-        enum class REPLY_TYPE {
+        enum REPLY_TYPE {
+            REDIS_REPLY_CONN_ERR=-1,
             REDIS_REPLY_STRING_=1,
             REDIS_REPLY_ARRAY_,
             REDIS_REPLY_INTEGER_,
@@ -55,25 +56,39 @@ class ByeRedis {
         std::string alias; 
 
         std::vector<std::string> m_psubs;
-        ArrayLockFreeQueue<std::string, (2 << 16)> m_jobs;
-        std::string m_currentJob;
+        struct JobStruct {
+            std::string job;
+            std::function<void(std::string, int)> callback;
+            JobStruct(const std::string& j, std::function<void(std::string, int)> c): 
+                job(j), callback(c) {}
+
+            JobStruct() {}
+        };
+        ArrayLockFreeQueue<JobStruct, (2 << 16)> m_jobs;
+        JobStruct m_currentJob;
         virtual ~ByeRedis() { 
             redisFree(m_c);
+        }
+
+        void command(const JobStruct& js) { 
+            m_jobs.push(js); // JobStruct(cmd, callback));
         }
 
         template<typename HandlerT, typename HandlerC, typename HandlerS>
         void run(HandlerT handler, HandlerC conn, HandlerS subs) { 
             m_lastPsub = Chrono::unixTimeStamp();
+            printf("%d ..................\n", __LINE__);
             while(1) {
                 // ksooMutex.lock(); 
                 if(Chrono::unixTimeStamp() - m_lastPsub >= 1000) {
                     m_lastPsub = Chrono::unixTimeStamp();
                     for(int i=0; i<m_psubs.size(); i++) {
-                        m_jobs.push(m_psubs[i]);
+                        m_jobs.push(JobStruct(m_psubs[i], nullptr));
                     }
                 }
-                if (m_currentJob == "") { 
-                    if(!m_jobs.pop(m_currentJob)) {
+                // 현재 작업이 없을 때 가져옴
+                if (m_currentJob.job == "") { 
+                    if(!m_jobs.pop(m_currentJob)) { 
                         continue;
                     }
                 } 
@@ -83,8 +98,8 @@ class ByeRedis {
                         connect();
                         break;
                     }
-                    std::string t = m_currentJob; 
-                    reply = (redisReply*)redisCommand(m_c, t.c_str()); 
+                    std::string t = m_currentJob.job;
+                    reply = (redisReply*)::redisCommand(m_c, t.c_str()); 
                     if(m_c->err) {
                         CONN_TYPE responseCode;
                         std::string response;
@@ -95,6 +110,9 @@ class ByeRedis {
                             freeReplyObject(reply);
                         }
                         conn(response, responseCode);
+                        if (m_currentJob.callback != nullptr) {
+                            m_currentJob.callback("", (int)REDIS_REPLY_CONN_ERR);
+                        }
                         connect();
                         break;
                     }else {
@@ -102,15 +120,20 @@ class ByeRedis {
                             // process
                             REPLY_TYPE responseCode = (REPLY_TYPE)reply->type;
                             std::string response;
+                            if(reply->str) {
+                                response = reply->str; // null -> no data; 
+                            } 
+                            if (m_currentJob.callback != nullptr) {
+                                m_currentJob.callback(response, (int)responseCode);
+                            }
+                            handler(response, responseCode, t);
                             if(reply->type == REDIS_REPLY_ERROR) {
                                 m_errorCount++;
                                 printf("[%s] command: %s error\n", alias.c_str(), t.c_str());
                                 if(m_errorCount >= 15) {
                                     m_errorCount = 0;
-                                    m_currentJob = "";
                                 }
                             } else if(reply->type == REDIS_REPLY_NIL) {
-                                m_currentJob = "";
                             } else if(reply->type == REDIS_REPLY_ARRAY) {
                                 if(reply->elements >= 4) {
                                     std::vector<std::string> result;
@@ -123,14 +146,10 @@ class ByeRedis {
                                     }
                                     subs(result);
                                 }
-                                m_currentJob = "";
                             } else {
-                                if(reply->str) {
-                                    response = reply->str; // null -> no data; 
-                                } 
-                                m_currentJob = "";
-                                handler(response, responseCode, t);
+                                // printf("===========call handle======================\n");
                             } 
+                            m_currentJob.job = "";
                             // sleep(1);
                             freeReplyObject(reply);
                         }
@@ -148,7 +167,7 @@ class ByeRedis {
                 auto m_authKey = m_hosts[randomIndex].authkey;
                 printf("[%s] try connect! %s:%d\n", alias.c_str(), m_host.c_str(), m_port);
                 REDIS_OPTIONS_SET_TCP(&options, m_host.c_str(), m_port);
-                struct timeval timeout = { 1, 500000 }; // 1.5 seconds
+                struct timeval timeout = { 0, 500000 }; // 1.5 seconds
                 options.connect_timeout = &timeout;
                 // m_c = redisConnectWithTimeout(m_host.c_str(), m_port, m_timeout);
                 m_c = redisConnectWithOptions(&options); // m_host.c_str(), m_port, m_timeout);
@@ -163,7 +182,7 @@ class ByeRedis {
                     continue;
                 }
                 redisReply *reply; 
-                reply = (redisReply*)redisCommand(m_c, m_authKey.c_str());
+                reply = (redisReply*)::redisCommand(m_c, m_authKey.c_str());
                 if(reply) {
                     freeReplyObject(reply);
                 }
